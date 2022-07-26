@@ -1,0 +1,255 @@
+---
+title: "RNA-seq_analysis"
+author: "Mette Ludwig"
+date: "2022-07-26"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r, message = FALSE}
+library(readxl)
+library(openxlsx)
+library(gmodels) 
+library(preprocessCore)
+library(dplyr) 
+library(Matrix)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(ggraph)
+library(tidyr)
+library(reshape2) 
+library(DESeq2)
+library(lmtest)
+library(dplyr)
+library(tidyverse)
+library(gprofiler2)
+library(wesanderson)
+library(grid)
+library(VennDiagram)
+```
+
+
+# Load data
+```{r}
+mapping.data <- read.table(gzfile("/projects/mludwig/Ludwig-2021/data/gene_info/Mus_musculus.GRCm38.90.gene_name_version2ensembl.txt.gz"), 
+                           header = T)
+
+path.meta <- "/projects/xbq246/20201206-nicotine-lira-bulk/deseq2_all_samples/samplesheet_SCOP-0106-all_samples.txt"
+meta <- read.table(path.meta, header = T)
+
+path.counts <- "/projects/xbq246/20201206-nicotine-lira-bulk/deseq2_all_samples/raw_counts_SCOP-0106-all_samples_matrix.txt"
+bulk <- read.table(path.counts, header = T)
+bulk$gene_name <- gsub("\\..*", "", bulk$gene_name)
+bulk$gene_name <- mapping.data$gene_name_optimal[match(bulk$gene_name, mapping.data$ensembl_gene_id)] # Map from ensembl ID to gene symbol 
+bulk <- bulk[!(is.na(bulk$gene_name)),]
+rownames(bulk) <- bulk$gene_name
+bulk <- bulk[, -1]
+colnames(bulk) <- meta$SampleName[match(colnames(bulk), meta$Filename)]
+bulk <- bulk[, meta$SampleName]
+
+idx.remove <- which(apply(bulk, 1, var) == 0) # Remove genes with zero variance
+bulk <- bulk[-c(idx.remove), ]
+
+# Remove outliers with > 3 SD on PC1 and PC2
+meta <- meta[-100, ]
+bulk <- bulk[,-100]
+```
+
+
+# Differential expression analysis - co-administration vs. control
+```{r}
+bulk.sub <- bulk
+bulk.sub <- bulk.sub[, intersect(grep("Arc", meta$Tissue), grep("Combo|Vehicle", meta$Condition))]
+treatment <- gsub("\\_..*", "", colnames(bulk.sub))
+treatment <- factor(treatment, levels = c("Vehicle", "Combo"))
+
+dds <- DESeqDataSetFromMatrix(bulk.sub, DataFrame(treatment), ~ treatment)
+dds <- DESeq(dds)
+resultsNames(dds) 
+DEGs.combo <- results(dds, name = "treatment_Combo_vs_Vehicle") 
+DEGs.combo <- data.frame(DEGs.combo)
+```
+
+
+# Gene Ontology analysis
+```{r}
+# GO analysis of differentially expressed genes
+query <- rownames(DEGs.combo)[which(DEGs.combo$padj < 0.05)]
+
+module.GO.terms <- gost(query = query,
+                        organism = "mmusculus",
+                        ordered_query = F, correction_method = "fdr",
+                        exclude_iea = T, 
+                        sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"),
+                        evcodes = T)
+
+GO.terms <- module.GO.terms[[1]] %>% select(term_name, term_size, p_value, intersection_size, intersection) %>% 
+  filter(term_size <= 500) %>% arrange(p_value) %>% top_n(5, -p_value) %>%
+  mutate(x = fct_reorder(str_wrap(term_name, 20), -p_value)) %>% 
+  mutate(y = -log10(p_value)) 
+
+# Plot
+GO.plot <- ggplot(GO.terms, aes(x,y)) + 
+  geom_col(colour="black", width=1, fill="#D69C4E", alpha=0.5, size=0.3) +
+  theme_pubr(legend="none") + 
+  theme(axis.text.x = element_text(size=8, face="bold"),
+        axis.text.y = element_text(size=8, face="bold"),
+        axis.title.x = element_text(size=8, face="bold"),
+        # margin: top, right, bottom, and left
+        plot.margin = unit(c(0, 0.5, 0, 0), "cm")) +
+  ggsci::scale_fill_lancet() +
+  coord_flip() +
+  xlab(NULL) + ylab(expression(paste(bold(-log[10]),bold("("),
+                                       bolditalic("P"),bold(")")))) 
+GO.plot
+```
+
+```{r}
+# Save
+write.xlsx(GO.terms, file = "/projects/mludwig/Falk-2022/output/tables/GO_Combo_vs_Vehicle.xlsx", rowNames = F)
+```
+
+
+# Differential expression analysis - nicotine/liraglutide vs. control
+```{r}
+# Liraglutide vs. control
+bulk.sub <- bulk
+bulk.sub <- bulk.sub[, intersect(grep("Arc", meta$Tissue), grep("Liraglutide|Vehicle", meta$Condition))]
+
+treatment <- gsub("\\_..*", "", colnames(bulk.sub))
+treatment <- factor(treatment, levels = c("Vehicle", "Liraglutide"))
+
+dds <- DESeqDataSetFromMatrix(bulk.sub, DataFrame(treatment), ~ treatment)
+dds <- DESeq(dds)
+resultsNames(dds) 
+DEGs.liraglutide <- results(dds, name = "treatment_Liraglutide_vs_Vehicle") 
+DEGs.liraglutide <- data.frame(DEGs.liraglutide)
+
+# Nicotine vs. control
+bulk.sub <- bulk
+bulk.sub <- bulk.sub[, intersect(grep("Arc", meta$Tissue), grep("Nicotine|Vehicle", meta$Condition))]
+
+treatment <- gsub("\\_..*", "", colnames(bulk.sub))
+treatment <- factor(treatment, levels = c("Vehicle", "Nicotine"))
+
+dds <- DESeqDataSetFromMatrix(bulk.sub, DataFrame(treatment), ~ treatment)
+dds <- DESeq(dds)
+resultsNames(dds) 
+DEGs.nicotine <- results(dds, name = "treatment_Nicotine_vs_Vehicle") 
+DEGs.nicotine <- data.frame(DEGs.nicotine)
+```
+
+
+# Plot Venn diagram
+```{r}
+DEGs.combo.venn <- DEGs.combo[which(DEGs.combo$padj < 0.05),]
+DEGs.liraglutide.venn <- DEGs.liraglutide[which(DEGs.liraglutide$padj < 0.05),]
+DEGs.nicotine.venn <- DEGs.nicotine[which(DEGs.nicotine$padj < 0.05),]
+
+genes <- union(union(rownames(DEGs.combo.venn), rownames(DEGs.liraglutide.venn)), rownames(DEGs.nicotine.venn))
+venn.data <- data.frame(matrix(0, nrow = length(genes), ncol = 3))
+rownames(venn.data) <- genes
+colnames(venn.data) <- c("combo", "liraglutide", "nicotine")
+
+venn.data$combo[which(rownames(venn.data) %in% rownames(DEGs.combo.venn))] <- 1
+venn.data$liraglutide[which(rownames(venn.data) %in% rownames(DEGs.liraglutide.venn))] <- 1
+
+grid.newpage()
+png("/projects/mludwig/Falk-2022/output/figures/venn_diagram.png",
+    pointsize = 1,
+    width = 960, height = 960, res = 2250)
+draw.pairwise.venn(area1 = nrow(subset(venn.data, combo == 1)), 
+                 area2 = nrow(subset(venn.data, liraglutide == 1)),
+                 cross.area = nrow(subset(venn.data, combo == 1 & liraglutide == 1)), 
+                 category = c("Combo", "Liraglutide"), 
+                 lty = "blank",
+                 fontfamily = "helvetica",
+                 cat.fontfamily = "helvetica",
+                 cat.fontface = "bold",
+                 fill = c("#6A0F91", "#B9B700"),
+                 cat.dist = .1,
+                 margin = 0.05,
+                 cat.just = list(c(-1.5, 27), c(2, 27)))
+dev.off()
+```
+
+
+# Plot top 20 genes in top 5 GO terms
+```{r}
+GO.genes <- lapply(GO.terms$intersection, noquote)
+GO.genes <- lapply(GO.genes, function(x) str_split(x, pattern = ","))
+GO.genes <- unique(unlist(GO.genes))
+
+ntop <- 20
+top.genes <- GO.genes[order(DEGs.combo[GO.genes, "pvalue"], decreasing = F)][1:ntop]
+
+GO.genes.data1 <- DEGs.combo[top.genes, ]
+GO.genes.data1$gene <- rownames(GO.genes.data1)
+GO.genes.data1$treatment <- "Co-administration"
+
+GO.genes.data2 <- DEGs.liraglutide[top.genes, ]
+GO.genes.data2$gene <- rownames(GO.genes.data2)
+GO.genes.data2$treatment <- "Liraglutide"
+
+
+GO.genes.data3 <- DEGs.nicotine[top.genes, ]
+GO.genes.data3$gene <- rownames(GO.genes.data3)
+GO.genes.data3$treatment <- "Nicotine"
+
+
+GO.genes.data <- rbind(GO.genes.data1, GO.genes.data2, GO.genes.data3)
+GO.genes.data$size <- -log10(GO.genes.data$padj)
+GO.genes.data$treatment <- factor(GO.genes.data$treatment, levels = c("Nicotine", "Liraglutide", "Co-administration"))
+
+
+GO.genes.plot <- ggplot(GO.genes.data, aes(x = gene, y=treatment)) +
+  geom_tile(size = 1, color = "white", fill="grey99") +
+  geom_point(aes(size = size, color = log2FoldChange)) + 
+  scale_size(name = expression(paste(bold(-log[10]),bold("("),
+                                     bolditalic("P"),bold(")"))),
+             range = c(0, 8), breaks = c(1, 2, 3),
+             limits = c(0, max(GO.genes.data$size))) +
+  scale_color_gradient2(low = "#0000FE", mid = "white", high = "#FB0106",
+                         breaks = seq(-1, 1.0, 1), limits = c(-1, 1),
+                        name = expression(paste(bold(log[2]),bold(" fold change")))) +
+  theme_pubr(legend = "top") + xlab(NULL) + ylab(NULL) + 
+  theme(axis.text.x = element_text(size=10, face="bold", angle=45, hjust = 1), 
+        axis.text.y = element_text(size=10, face="bold"),
+        legend.title = element_text(size=10, face="bold"), 
+        legend.text = element_text(size=10, face="bold"),
+        axis.line = element_line(colour = "black"),
+        # margin: top, right, bottom, and left
+        plot.margin = unit(c(0, 0, 0, 1), "cm")) +
+  guides(color = guide_colorbar(title.vjust = 0.8, order = 2),
+         shape = guide_legend(title.vjust = 0.8, order = 1))
+GO.genes.plot
+ggsave("/projects/mludwig/Falk-2022/output/figures/GO_genes.png", GO.genes.plot, height = 60, width = 200,
+       units = "mm")
+```
+
+# Save differentially expression analysis results
+```{r}
+# Co-administration vs. vehicle
+DEGs.write <- DEGs.combo[!(is.na(DEGs.combo$padj)), ]
+DEGs.write <- DEGs.write[order(DEGs.write$pvalue),]
+DEGs.write <- cbind(gene = rownames(DEGs.write), DEGs.write)
+write.xlsx(DEGs.write, file = "/projects/mludwig/Falk-2022/output/tables/DEGs_Combo_vs_Vehicle.xlsx", rowNames = F)
+
+
+# Liraglutide vs. vehicle
+DEGs.write <- DEGs.liraglutide[!(is.na(DEGs.liraglutide$padj)), ]
+DEGs.write <- DEGs.write[order(DEGs.write$pvalue),]
+DEGs.write <- cbind(gene = rownames(DEGs.write), DEGs.write)
+write.xlsx(DEGs.write, file = "/projects/mludwig/Falk-2022/output/tables/DEGs_Liraglutide_vs_Vehicle.xlsx", rowNames = F)
+
+
+# Nicotine vs. vehicle
+DEGs.write <- DEGs.nicotine[!(is.na(DEGs.nicotine$padj)), ]
+DEGs.write <- DEGs.write[order(DEGs.write$pvalue),]
+DEGs.write <- cbind(gene = rownames(DEGs.write), DEGs.write)
+write.xlsx(DEGs.write, file = "/projects/mludwig/Falk-2022/output/tables/DEGs_Nicotine_vs_Vehicle.xlsx", rowNames = F)
+```
+
+
